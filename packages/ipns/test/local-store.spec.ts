@@ -1,10 +1,11 @@
 import { expect } from 'aegir/chai'
 import { CID } from 'multiformats/cid'
+import Sinon from 'sinon'
 import { localStore } from '../src/local-store.ts'
 import { IPNSEntry } from '../src/pb/ipns.ts'
 import { IPNSPublishMetadata, Upkeep } from '../src/pb/metadata.ts'
 import { createIPNSRecord } from '../src/records.ts'
-import { ipnsMetadataKey, multihashToIPNSRoutingKey } from '../src/utils.ts'
+import { decodeExtensibleData, dhtRoutingKey, ipnsMetadataKey, multihashToIPNSRoutingKey } from '../src/utils.ts'
 import { createIPNS } from './fixtures/create-ipns.ts'
 import type { LocalStore } from '../src/local-store.ts'
 import type { CreateIPNSResult } from './fixtures/create-ipns.ts'
@@ -96,6 +97,87 @@ describe('local-store', () => {
         overwrite: true,
         metadata: { upkeep: Upkeep.rebroadcast }
       })).to.eventually.be.rejected()
+    })
+  })
+
+  describe('concurrent writes', () => {
+    it('does not replace a newer record with an older record', async () => {
+      const key = await result.keychain.generateKey('test-key')
+      const routingKey = multihashToIPNSRoutingKey(key.publicKey.toMultihash())
+      const cachedRecord = await createIPNSRecord(key, '/cached', 3n, 24 * 60 * 60 * 1000)
+      const newerRecord = await createIPNSRecord(key, '/newer', 5n, 24 * 60 * 60 * 1000)
+      const olderRecord = await createIPNSRecord(key, '/older', 4n, 24 * 60 * 60 * 1000)
+      const secondStore = localStore(result.datastore, result.log)
+
+      await store.put(routingKey, IPNSEntry.encode(cachedRecord))
+
+      await Promise.all([
+        store.put(routingKey, IPNSEntry.encode(newerRecord)),
+        secondStore.put(routingKey, IPNSEntry.encode(olderRecord))
+      ])
+
+      const { record } = await store.get(routingKey)
+      const data = decodeExtensibleData(IPNSEntry.decode(record).data)
+
+      expect(data.Sequence).to.equal(5n)
+      expect(data.Value).to.equalBytes(new TextEncoder().encode('/newer'))
+    })
+
+    it('continues queued writes after an earlier write fails', async () => {
+      const key = await result.keychain.generateKey('test-key')
+      const routingKey = multihashToIPNSRoutingKey(key.publicKey.toMultihash())
+      const cachedRecord = await createIPNSRecord(key, '/cached', 1n, 24 * 60 * 60 * 1000)
+      const validRecord = await createIPNSRecord(key, '/valid', 2n, 24 * 60 * 60 * 1000)
+      const secondStore = localStore(result.datastore, result.log)
+
+      await store.put(routingKey, IPNSEntry.encode(cachedRecord))
+
+      const results = await Promise.allSettled([
+        store.put(routingKey, new TextEncoder().encode('invalid record')),
+        secondStore.put(routingKey, IPNSEntry.encode(validRecord))
+      ])
+
+      expect(results[0].status).to.equal('rejected')
+      expect(results[1].status).to.equal('fulfilled')
+
+      const { record } = await store.get(routingKey)
+      const data = decodeExtensibleData(IPNSEntry.decode(record).data)
+
+      expect(data.Sequence).to.equal(2n)
+      expect(data.Value).to.equalBytes(new TextEncoder().encode('/valid'))
+    })
+
+    it('processes writes for different routing keys concurrently', async () => {
+      const firstKey = await result.keychain.generateKey('first-key')
+      const secondKey = await result.keychain.generateKey('second-key')
+      const firstRoutingKey = multihashToIPNSRoutingKey(firstKey.publicKey.toMultihash())
+      const secondRoutingKey = multihashToIPNSRoutingKey(secondKey.publicKey.toMultihash())
+      const firstRecord = await createIPNSRecord(firstKey, '/first', 1n, 24 * 60 * 60 * 1000)
+      const secondRecord = await createIPNSRecord(secondKey, '/second', 1n, 24 * 60 * 60 * 1000)
+      const firstDatastoreKey = dhtRoutingKey(firstRoutingKey).toString()
+      const originalGet = result.datastore.get.bind(result.datastore)
+      let releaseFirstGet!: () => void
+      let firstGetStartedResolve!: () => void
+      const releaseFirst = new Promise<void>(resolve => { releaseFirstGet = resolve })
+      const firstGetStarted = new Promise<void>(resolve => { firstGetStartedResolve = resolve })
+
+      Sinon.stub(result.datastore, 'get').callsFake(async (key, options) => {
+        if (key.toString() === firstDatastoreKey) {
+          firstGetStartedResolve()
+          await releaseFirst
+        }
+
+        return originalGet(key, options)
+      })
+
+      const firstPut = store.put(firstRoutingKey, IPNSEntry.encode(firstRecord))
+      await firstGetStarted
+
+      await store.put(secondRoutingKey, IPNSEntry.encode(secondRecord))
+      expect(await store.has(secondRoutingKey)).to.be.true()
+
+      releaseFirstGet()
+      await firstPut
     })
   })
 })

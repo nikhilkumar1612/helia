@@ -3,11 +3,15 @@ import { CustomProgressEvent } from 'progress-events'
 import { equals as uint8ArrayEquals } from 'uint8arrays/equals'
 import { fromString as uint8ArrayFromString } from 'uint8arrays/from-string'
 import { withArrayBuffer } from 'uint8arrays/with-array-buffer'
+import { IPNSEntry } from './pb/ipns.ts'
 import { IPNSPublishMetadata, Upkeep } from './pb/metadata.ts'
+import { ipnsSelector } from './selector.ts'
 import { dhtRoutingKey, DHT_RECORD_PREFIX, ipnsMetadataKey } from './utils.ts'
 import type { DatastoreProgressEvents, IPNSRoutingGetOptions, IPNSRoutingPutOptions } from './routing/index.ts'
 import type { AbortOptions, Logger } from '@libp2p/interface'
 import type { Datastore } from 'interface-datastore'
+
+const putLocks = new Map<string, Promise<void>>()
 
 export interface GetResult {
   record: Uint8Array<ArrayBuffer>
@@ -28,6 +32,9 @@ export interface ListOptions extends AbortOptions {
 export interface LocalStore {
   /**
    * Put an IPNS record into the datastore
+   *
+   * An existing record is only replaced when the incoming record is newer.
+   * Passing `overwrite: true` allows an identical record to be re-stamped.
    *
    * @param routingKey - The routing key for the IPNS record
    * @param marshaledRecord - The marshaled IPNS record
@@ -110,37 +117,46 @@ export function localStore (datastore: Datastore, log: Logger): LocalStore {
       try {
         const key = dhtRoutingKey(routingKey)
 
-        if (options.overwrite !== true) {
-          // don't overwrite existing, identical records as this will affect the
-          // TTL
+        await withKeyLock(putLocks, key.toString(), async () => {
+          options.signal?.throwIfAborted()
+
           try {
             const existingBuf = await datastore.get(key)
             const existingRecord = Record.deserialize(existingBuf)
 
             if (uint8ArrayEquals(existingRecord.value, marshalledRecord)) {
-              return
+              // An explicit overwrite re-stamps an identical record's TTL.
+              if (options.overwrite !== true) {
+                return
+              }
+            } else {
+              const existingEntry = IPNSEntry.decode(existingRecord.value)
+              const incomingEntry = IPNSEntry.decode(marshalledRecord)
+
+              if (ipnsSelector(routingKey, [existingEntry, incomingEntry]) === 0) {
+                return
+              }
             }
           } catch (err: any) {
             if (err.name !== 'NotFoundError') {
               throw err
             }
           }
-        }
+          // Marshal to libp2p record as the DHT does
+          const record = new Record(routingKey, marshalledRecord, new Date())
 
-        // Marshal to libp2p record as the DHT does
-        const record = new Record(routingKey, marshalledRecord, new Date())
+          options.onProgress?.(new CustomProgressEvent('ipns:routing:datastore:put'))
+          const batch = datastore.batch()
+          batch.put(key, record.serialize())
 
-        options.onProgress?.(new CustomProgressEvent('ipns:routing:datastore:put'))
-        const batch = datastore.batch()
-        batch.put(key, record.serialize())
-
-        if (options.metadata != null) {
-          // merge into any existing metadata (preserving keyName/lifetime on a
-          // partial update) and validate the result before writing it
-          const metadata = await mergeMetadata(datastore, routingKey, options.metadata, options)
-          batch.put(ipnsMetadataKey(routingKey), IPNSPublishMetadata.encode(metadata))
-        }
-        await batch.commit(options)
+          if (options.metadata != null) {
+            // merge into any existing metadata (preserving keyName/lifetime on a
+            // partial update) and validate the result before writing it
+            const metadata = await mergeMetadata(datastore, routingKey, options.metadata, options)
+            batch.put(ipnsMetadataKey(routingKey), IPNSPublishMetadata.encode(metadata))
+          }
+          await batch.commit(options)
+        })
       } catch (err: any) {
         options.onProgress?.(new CustomProgressEvent<Error>('ipns:routing:datastore:error', err))
         throw err
@@ -213,6 +229,22 @@ export function localStore (datastore: Datastore, log: Logger): LocalStore {
         options.onProgress?.(new CustomProgressEvent<Error>('ipns:routing:datastore:error', err))
         throw err
       }
+    }
+  }
+}
+
+async function withKeyLock <T> (locks: Map<string, Promise<void>>, key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = locks.get(key) ?? Promise.resolve()
+  const current = previous.then(fn)
+  const tail = current.then(() => {}, () => {})
+
+  locks.set(key, tail)
+
+  try {
+    return await current
+  } finally {
+    if (locks.get(key) === tail) {
+      locks.delete(key)
     }
   }
 }
